@@ -18,6 +18,8 @@ async function handler(req: Request, { params }: { params: { path: string[] } })
   const resp = await fetch(targetUrl, init);
 
   const respHeaders = new Headers(resp.headers);
+  respHeaders.delete('content-encoding');
+  respHeaders.delete('content-length');
   respHeaders.set('Access-Control-Allow-Origin', '*');
   respHeaders.set('Access-Control-Allow-Headers', '*');
   respHeaders.set('Access-Control-Allow-Methods', '*');
