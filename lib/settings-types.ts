@@ -210,6 +210,10 @@ export type NovelAiPreset = {
 
 export type NovelAiSettings = {
     apiKey: string;
+    /** NovelAI 反代地址。留空 = 直接用官方 https://image.novelai.net。
+     *  填第三方反代（如 https://example.com/api/novelai）时，请求改发到该地址，
+     *  路径拼接规则见 lib/image-generation-service.ts 的 buildNovelAiUrl。 */
+    baseUrl?: string;
     activePresetId: string;
     presets: NovelAiPreset[];
 };

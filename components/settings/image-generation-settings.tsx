@@ -131,6 +131,7 @@ export function ImageGenerationSettings() {
         const activePreset = presets.find(p => p.id === nai?.activePresetId) || presets[0];
         return {
             apiKey: nai?.apiKey || "",
+            baseUrl: nai?.baseUrl || "",
             activePresetId: activePreset.id,
             presets,
             activePreset,
@@ -142,6 +143,7 @@ export function ImageGenerationSettings() {
             ...settings,
             novelai: {
                 apiKey: naiSettings.apiKey,
+                baseUrl: naiSettings.baseUrl,
                 activePresetId: naiSettings.activePresetId,
                 presets: naiSettings.presets,
                 ...patch,
@@ -233,7 +235,7 @@ export function ImageGenerationSettings() {
         }
         setIsFetchingNaiModels(true);
         try {
-            const fetched = await fetchNovelAiModels(naiSettings.apiKey);
+            const fetched = await fetchNovelAiModels(naiSettings.apiKey, naiSettings.baseUrl);
             setNaiModels(fetched);
             setNaiTokenStatus({
                 success: true,
@@ -351,7 +353,7 @@ export function ImageGenerationSettings() {
                                 }}
                                 placeholder="pst-..."
                             />
-                            <span className="menu-desc ml-1">可在 NovelAI 官网 Account 页面获取 Persistent API Token。</span>
+                            <span className="menu-desc ml-1">可在 NovelAI 官网 Account 页面获取 Persistent API Token；使用反代站时请填该站给你的 Key。</span>
                             {naiTokenStatus && (
                                 <div role={naiTokenStatus.success ? "status" : "alert"} className="mt-2">
                                     <Alert variant={naiTokenStatus.success ? "success" : "danger"}>
@@ -360,6 +362,19 @@ export function ImageGenerationSettings() {
                                     </Alert>
                                 </div>
                             )}
+                        </div>
+
+                        <div className="flex flex-col gap-1">
+                            <label className="menu-desc ml-1">反代地址（选填）</label>
+                            <Input
+                                type="text"
+                                value={naiSettings.baseUrl}
+                                onChange={(event) => updateNovelAi({ baseUrl: event.target.value })}
+                                placeholder="留空 = 官方 image.novelai.net"
+                            />
+                            <span className="menu-desc ml-1 opacity-70">
+                                填第三方 NovelAI 反代站地址（如 https://example.com/api/novelai），会自动补齐 /ai/generate-image。留空则直连官方接口。
+                            </span>
                         </div>
 
                         {/* 预设管理栏 */}

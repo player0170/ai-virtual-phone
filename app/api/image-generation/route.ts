@@ -3,7 +3,9 @@ import { ProxyAgent, type Dispatcher } from "undici";
 import JSZip from "jszip";
 import {
   NOVELAI_DEFAULT_MODEL,
+  buildNovelAiGenerateUrl,
   getNovelAiResolution,
+  isOfficialNovelAiBaseUrl,
   isNovelAiNoiseSchedule,
   isNovelAiResolution,
   isNovelAiSampler,
@@ -169,6 +171,9 @@ async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ st
     if (input.noiseSchedule !== undefined && typeof input.noiseSchedule !== "string") {
       return { status: 400, body: { error: "NovelAI 调度器格式无效" } };
     }
+    if (input.baseUrl !== undefined && typeof input.baseUrl !== "string") {
+      return { status: 400, body: { error: "NovelAI 反代地址格式无效" } };
+    }
     for (const [label, value] of [
       ["Quality Toggle", input.qualityToggle],
       ["SMEA", input.smea],
@@ -208,12 +213,16 @@ async function runNovelAiGeneration(input: ImageGenerationRequest): Promise<{ st
 
     const { width, height } = getNovelAiResolution(input.size);
 
-    const url = "https://image.novelai.net/ai/generate-image";
+    const naiBaseUrl = typeof input.baseUrl === "string" ? input.baseUrl.trim() : "";
+    const url = buildNovelAiGenerateUrl(naiBaseUrl);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
-      Origin: "https://novelai.net",
-      Referer: "https://novelai.net/",
+      // Origin/Referer 只在打官方接口时附带（官方会校验来源）。
+      // 第三方反代加上这两个头反而可能被它的 WAF 判成伪造来源。
+      ...(isOfficialNovelAiBaseUrl(naiBaseUrl)
+        ? { Origin: "https://novelai.net", Referer: "https://novelai.net/" }
+        : {}),
     };
 
     const parameters: Record<string, unknown> = {

@@ -1,3 +1,37 @@
+export const NOVELAI_OFFICIAL_BASE_URL = "https://image.novelai.net";
+
+/**
+ * 拼出 NovelAI 生图地址。
+ * baseUrl 留空 = 官方接口，行为与加入本功能之前完全一致；
+ * 填第三方反代时按它已有的路径智能补齐（支持只填域名、填到 /api/novelai、或直接填全路径）。
+ */
+export function buildNovelAiGenerateUrl(baseUrl?: string | null): string {
+  const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!trimmed) return `${NOVELAI_OFFICIAL_BASE_URL}/ai/generate-image`;
+  const withScheme = /^https?:\/\//i.test(trimmed)
+    ? trimmed
+    : `https://${trimmed.replace(/^\/+/, "")}`;
+  if (/\/ai\/generate-image$/i.test(withScheme)) return withScheme;
+  if (/\/ai$/i.test(withScheme)) return `${withScheme}/generate-image`;
+  return `${withScheme}/ai/generate-image`;
+}
+
+/** Token 校验用的 /user/data 地址，规则与上面一致。 */
+export function buildNovelAiUserDataUrl(baseUrl?: string | null): string {
+  const trimmed = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!trimmed) return `${NOVELAI_OFFICIAL_BASE_URL}/user/data`;
+  const withScheme = /^https?:\/\//i.test(trimmed)
+    ? trimmed
+    : `https://${trimmed.replace(/^\/+/, "")}`;
+  if (/\/user\/data$/i.test(withScheme)) return withScheme;
+  return `${withScheme.replace(/\/ai(?:\/generate-image)?$/i, "")}/user/data`;
+}
+
+/** 是否走官方地址（决定要不要附带 novelai.net 的 Origin/Referer）。 */
+export function isOfficialNovelAiBaseUrl(baseUrl?: string | null): boolean {
+  return !String(baseUrl || "").trim();
+}
+
 export const NOVELAI_DEFAULT_MODEL = "nai-diffusion-4-curated-preview";
 export const NOVELAI_DEFAULT_RESOLUTION = "832x1216";
 export const NOVELAI_DEFAULT_SAMPLER = "k_euler";

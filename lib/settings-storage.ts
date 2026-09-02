@@ -693,6 +693,7 @@ export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
     extraPrompt: "",
     novelai: {
         apiKey: "",
+        baseUrl: "",
         activePresetId: DEFAULT_NOVELAI_PRESET.id,
         presets: [DEFAULT_NOVELAI_PRESET],
     },
@@ -755,6 +756,8 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
 
     const novelai: import("./settings-types").NovelAiSettings = {
         apiKey: typeof rawNai?.apiKey === "string" ? rawNai.apiKey : "",
+        // 反代地址：老数据没有这个字段时为空串，行为与改动前完全一致（走官方地址）
+        baseUrl: typeof rawNai?.baseUrl === "string" ? rawNai.baseUrl.trim() : "",
         activePresetId,
         presets: naiPresets,
     };
