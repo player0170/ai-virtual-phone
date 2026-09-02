@@ -1,4 +1,5 @@
 export const dynamic = 'force-dynamic';
+export const maxDuration = 180;
 
 async function handler(req: Request, { params }: { params: { path: string[] } }) {
   // 路径第一段是目标域名(比如 youzi.today),后面才是真正的接口路径
