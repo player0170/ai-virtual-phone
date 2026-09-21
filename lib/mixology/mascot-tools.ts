@@ -22,6 +22,9 @@ import {
     type MixMaterialKind,
     type MixSlotEntry,
     type MixTicketVar,
+    normalizeMixConnectorNames,
+    normalizeMixDialogueButton,
+    MIX_CONNECTOR_NAME_RE,
 } from "./types";
 import {
     MIX_CABINET_UPDATED_EVENT,
@@ -32,7 +35,12 @@ import {
     loadMixRecipes,
     saveMixMaterial,
     saveMixRecipe,
+    findMixConnector,
+    loadMixConnectors,
+    saveMixConnector,
+    deleteMixConnector,
 } from "./storage";
+import { MIX_CONNECTOR_KEY_PLACEHOLDER, MIX_CONNECTOR_PRESETS, parseMixConnectorHeaders } from "./connectors";
 
 import { buildMixCraftSpec } from "./crafting-guides";
 import { isMixCardFreeform, MIX_CARD_FIELD_KEYS, normalizeMixCardProfile } from "./card-freeform";
@@ -154,8 +162,13 @@ function describeMaterial(material: MixMaterial): string {
             field("清洗规则", material.rules.map((r, i) => `${i + 1}. /${r.find}/ → ${r.replace || "（删除）"}（${r.mode === "display" ? "仅显示" : "进上下文"}）`).join("\n"));
             break;
         case "mechanism":
-            field("钩子逻辑", material.script); field("界面代码", material.panelHtml);
+            if (material.trusted) lines.push("运行方式：信任模式（trusted = true，代码直接在对局页面里执行，用 mix.slot / mix.on 登记坑位与钩子）");
+            field(material.trusted ? "代码" : "钩子逻辑", material.script); field("界面代码", material.panelHtml);
             field("摆放", material.layout ? mixPanelLayoutSummary(material.layout) : undefined);
+            if (material.dialogueButton?.icon) field("对白按钮", `${material.dialogueButton.icon}${material.dialogueButton.title ? ` ${material.dialogueButton.title}` : ""}`);
+            if (material.connectors?.length) {
+                field("需要的连接器", material.connectors.map((n) => `${n}${findMixConnector(n) ? "（用户本机已配）" : "（用户本机未配，需到酒柜「连接器」里创建）"}`).join("\n"));
+            }
             break;
         default:
             field(`${MIX_KIND_LABELS[material.kind]}内容`, (material as { content?: string }).content);
@@ -190,7 +203,7 @@ export function mixToolReadCraftSpec(args: Record<string, unknown>): ToolResult 
 type FieldSpec = { key: string; kinds: MixMaterialKind[] };
 /** 各 kind 允许写入的正文字段（元信息 name/hook/tags 全类通用，单独处理） */
 const CONTENT_FIELDS: FieldSpec[] = [
-    { key: "content", kinds: ["persona", "preface", "base", "flavor", "glass", "strength"] },
+    { key: "content", kinds: ["persona", "preface", "base", "flavor", "glass", "strength", "checklist"] },
     // 序言可整套覆写各分段标题（对象 {base:"…",character:"…",…}，留空键用默认）
     { key: "sectionTitles", kinds: ["preface"] },
     { key: "userName", kinds: ["persona"] },
@@ -220,6 +233,12 @@ const CONTENT_FIELDS: FieldSpec[] = [
     { key: "script", kinds: ["mechanism"] },
     { key: "panelHtml", kinds: ["mechanism"] },
     { key: "layout", kinds: ["mechanism"] },
+    // 界面要用的连接器名字（字符串数组）；mix.call 只放行声明过的
+    { key: "connectors", kinds: ["mechanism"] },
+    // 对白按钮（旧写法，仍认）：{icon, title}。新写法是界面代码里 window.mix.dialogueButton({icon,title}) 登记
+    { key: "dialogueButton", kinds: ["mechanism"] },
+    // 信任模式：代码直接在页面里跑（不进沙盒）
+    { key: "trusted", kinds: ["mechanism"] },
 ];
 
 function normalizeOpenings(value: unknown): string[] | { err: string } {
@@ -309,6 +328,29 @@ function applyContentFields(target: Record<string, unknown>, kind: MixMaterialKi
                 const normalized = normalizeMixPanelLayout(args[spec.key]);
                 if (!normalized) return 'layout 必须是摆放对象，如 {"slot":"inputbar-left","icon":"🎲","autoHeight":true}。';
                 target.layout = normalized;
+                break;
+            }
+            case "trusted": {
+                const v = args[spec.key];
+                if (v !== true && v !== false) return "trusted 只能是 true（信任模式：代码直接在页面里运行）或 false（沙盒）。";
+                if (v) target.trusted = true; else delete target.trusted;
+                break;
+            }
+            case "dialogueButton": {
+                const raw = args[spec.key];
+                if (raw === null || raw === "" || raw === false) { delete target.dialogueButton; break; }
+                const button = normalizeMixDialogueButton(raw);
+                if (!button) return 'dialogueButton 必须是 {"icon":"🔊","title":"朗读这句"}（icon 必填，一两个 emoji 或单字）；传 null 取消。';
+                target.dialogueButton = button;
+                break;
+            }
+            case "connectors": {
+                const names = normalizeMixConnectorNames(args[spec.key]);
+                if (Array.isArray(args[spec.key]) && (args[spec.key] as unknown[]).length && !names.length) {
+                    return "connectors 必须是名字数组，名字只能用小写字母、数字、-、_（如 [\"tts\"]）。";
+                }
+                if (names.length) target.connectors = names;
+                else delete target.connectors;
                 break;
             }
             case "historyFeed": {
@@ -408,7 +450,7 @@ function validateMaterial(material: Record<string, unknown>, kind: MixMaterialKi
         case "character":
             if (!Array.isArray(material.openings) || material.openings.length === 0) return "角色卡至少要有一条开场白（openings），否则开不了局。";
             return null;
-        case "persona": case "preface": case "base": case "flavor": case "glass": case "strength":
+        case "persona": case "preface": case "base": case "flavor": case "glass": case "strength": case "checklist":
             if (!has("content")) return `${MIX_KIND_LABELS[kind]}缺正文（content）。`;
             return null;
         case "ticket":
@@ -425,6 +467,7 @@ function validateMaterial(material: Record<string, unknown>, kind: MixMaterialKi
             if (!Array.isArray(material.rules) || material.rules.length === 0) return "滤网至少要有一条规则（rules）。";
             return null;
         case "mechanism":
+            if (material.trusted === true && !has("script")) return "信任模式的机括必须有 script（代码在页面里执行，用 mix.slot / mix.on 登记坑位与钩子）。";
             if (!has("script") && !has("panelHtml")) return "机括的钩子逻辑（script）与界面代码（panelHtml）至少要写一样。";
             return null;
     }
@@ -574,4 +617,119 @@ export function mixToolSaveRecipe(args: Record<string, unknown>): ToolResult {
         name: NAME, success: true,
         data: `${existing ? "已更新" : "已调好"}特调「${name}」：${picked.join(" + ")}。用户在独家特调 App 的吧台就能选它开局。`,
     };
+}
+
+// ── 连接器 ──────────────────────────────────────────
+// 连接器是用户自己的外部接口配置（机括界面用 mix.call 请宿主代调）。
+// 小卷可以替用户把连接器建好（预设一键、或自己写地址与模板），但密钥留占位——
+// 密钥不该经过对话与模型，用户到酒柜「连接器」里粘上即可。
+
+/** 请求头里的密钥打码：只告诉模型有没有、是不是还留着占位，不回真实值 */
+function describeConnectorHeaders(headers: Record<string, string>): string {
+    return Object.entries(headers)
+        .map(([key, value]) => {
+            const secret = /authorization|key|token|secret/i.test(key);
+            if (!secret) return `${key}: ${value}`;
+            return `${key}: ${value.includes(MIX_CONNECTOR_KEY_PLACEHOLDER) ? "（密钥还是占位，待用户填写）" : "（已填，不显示）"}`;
+        })
+        .join("；");
+}
+
+export function mixToolListConnectors(): ToolResult {
+    const NAME = "列出连接器";
+    const list = loadMixConnectors();
+    const lines: string[] = [];
+    lines.push(`本机连接器 ${list.length} 个。`);
+    for (const c of list) {
+        lines.push(`· ${c.name}${c.note ? `（${c.note}）` : ""} — ${c.method} ${c.url}，响应 ${c.response}${c.preset ? `，预设 ${c.preset}` : ""}`);
+        if (Object.keys(c.headers).length) lines.push(`　请求头：${describeConnectorHeaders(c.headers)}`);
+    }
+    lines.push(`可用预设：${MIX_CONNECTOR_PRESETS.map((p) => `${p.id}（${p.label}）`).join("、")}。`);
+    lines.push("官方机括「朗读」需要一个叫 tts 的连接器：装上它，对局里每句对白后面就有一颗喇叭，点一下念这句。");
+    return { name: NAME, success: true, data: lines.join("\n") };
+}
+
+type HeadersArg = { headers: Record<string, string> } | { err: string };
+function normalizeHeadersArg(value: unknown): HeadersArg {
+    if (value === undefined) return { headers: {} };
+    if (typeof value === "string") return { headers: parseMixConnectorHeaders(value) };
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { err: 'headers 必须是对象 {"名字":"值"} 或一行一条「名字: 值」的文本。' };
+    const out: Record<string, string> = {};
+    for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+        const name = key.trim();
+        if (!name) continue;
+        if (typeof raw !== "string") return { err: `请求头 ${name} 的值必须是字符串。` };
+        out[name] = raw;
+    }
+    return { headers: out };
+}
+
+export function mixToolSaveConnector(args: Record<string, unknown>): ToolResult {
+    const NAME = "创建连接器";
+    const presetId = text(args.preset).trim();
+    const preset = presetId ? MIX_CONNECTOR_PRESETS.find((p) => p.id === presetId) : null;
+    if (presetId && !preset) {
+        return { name: NAME, success: false, error: `没有叫 ${presetId} 的预设。可选：${MIX_CONNECTOR_PRESETS.map((p) => p.id).join(" / ")}` };
+    }
+    const built = preset?.build();
+    const name = (text(args.name).trim() || built?.name || "").toLowerCase();
+    if (!MIX_CONNECTOR_NAME_RE.test(name)) {
+        return { name: NAME, success: false, error: "name 只能用小写字母、数字、-、_，以字母或数字开头，最长 32 位（如 tts）。" };
+    }
+    const url = text(args.url).trim() || built?.url || "";
+    try {
+        const parsed = new URL(url.replace(/\{\{[^}]*\}\}/g, "x"));
+        if (!/^https?:$/.test(parsed.protocol)) throw new Error("bad");
+    } catch {
+        return { name: NAME, success: false, error: "url 要是完整的 http(s) 地址（用预设可不传）。" };
+    }
+    const headersArg = normalizeHeadersArg(args.headers);
+    if ("err" in headersArg) return { name: NAME, success: false, error: headersArg.err };
+    const headers = Object.keys(headersArg.headers).length ? headersArg.headers : built?.headers ?? {};
+    const method = args.method === "GET" ? "GET" : args.method === "POST" || args.method === undefined ? (built?.method ?? "POST") : null;
+    if (!method) return { name: NAME, success: false, error: 'method 只能是 "POST" 或 "GET"。' };
+    const response = args.response === undefined ? (built?.response ?? "json") : args.response;
+    if (response !== "json" && response !== "text" && response !== "blob") {
+        return { name: NAME, success: false, error: 'response 只能是 "json"（解析成对象）、"text" 或 "blob"（二进制转 data: URL）。' };
+    }
+    const body = args.body === undefined ? (built?.body ?? "") : text(args.body);
+    if (method === "POST" && !body.trim() && !preset) {
+        return { name: NAME, success: false, error: "POST 连接器需要 body 请求体模板（{{参数名}} 占位，可写 {{参数名|默认值}}）。" };
+    }
+
+    const existing = findMixConnector(name);
+    if (existing && args.overwrite !== true) {
+        return { name: NAME, success: false, error: `已经有叫「${name}」的连接器了。要覆盖请再传 overwrite: true；要保留就换个名字。` };
+    }
+    const note = text(args.note).trim() || built?.note;
+    saveMixConnector({
+        id: existing?.id ?? createMixId("mixconn"),
+        name,
+        note: note || undefined,
+        url,
+        method,
+        headers,
+        body,
+        response,
+        preset: preset?.id ?? existing?.preset,
+        createdAt: existing?.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+    });
+    const placeholder = Object.values(headers).some((v) => v.includes(MIX_CONNECTOR_KEY_PLACEHOLDER));
+    return {
+        name: NAME, success: true,
+        data: `连接器「${name}」已${existing ? "更新" : "创建"}（${method} ${url}）。`
+            + (placeholder
+                ? "\n密钥还是占位：请提醒用户到 独家特调 → 酒柜 → 右上角「连接器」→ 点开这一条，把请求头里的「你的密钥」换成自己的 API Key 并保存（可点「发一次试试」验证）。不要向用户索要密钥，密钥不经过对话。"
+                : "\n用户可到 独家特调 → 酒柜 → 「连接器」里查看或试调用。"),
+    };
+}
+
+export function mixToolDeleteConnector(args: Record<string, unknown>): ToolResult {
+    const NAME = "删除连接器";
+    const name = text(args.name).trim().toLowerCase();
+    const existing = name ? findMixConnector(name) : null;
+    if (!existing) return { name: NAME, success: false, error: `本机没有叫「${name || "（空）"}」的连接器。可先用 列出连接器 查看。` };
+    deleteMixConnector(existing.id);
+    return { name: NAME, success: true, data: `连接器「${name}」已删除。用到它的机括调用时会提示用户重新创建。` };
 }
