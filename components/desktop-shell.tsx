@@ -127,6 +127,7 @@ import type { DIYWidgetTemplate } from "@/lib/widget-types";
 import { DebugPromptPanel } from "@/components/debug-prompt-panel";
 import { QuickActionFloat } from "@/components/quick-action-float";
 import { CHAT_MESSAGE_PUSHED_EVENT, CHAT_REQUEST_REPLY_EVENT, hydrateChatStorage, loadChatSessions, loadChatMessages, pushChatMessage, type ChatMessage, type ChatSession } from "@/lib/chat-storage";
+import { CHAT_UNREAD_CHANGED_EVENT, ensureChatUnreadBaseline, getTotalChatUnreadCount, markAllChatRead, pruneChatReadState } from "@/lib/chat-unread";
 import { ensureGlobalBindingDefaults, resolveUserIdentity } from "@/lib/settings-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { generateChatCompletion, flattenCompletionResult } from "@/lib/chat-engine";
@@ -1073,6 +1074,13 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
   const customAppUpdateCheckingRef = useRef<Set<string>>(new Set());
   const activeAppRef = useRef<DesktopIconId | null>(null);
   const [customAppBadges, setCustomAppBadges] = useState<Record<string, number>>({});
+  // 内置「聊天」图标的未读总数（红标）。与自定义 APP 的角标分开：聊天数据在
+  // chat-storage，得自己算，见 lib/chat-unread.ts。
+  const [chatUnreadCount, setChatUnreadCount] = useState(0);
+  // 标记已读会派发未读变更事件，而重算函数又监听该事件——用它挡住自我递归
+  const unreadClearingRef = useRef(false);
+  // 聊天 App 是否在前台（挂载时 activeApp 还没进 ref，用 effect 同步）
+  const chatForeground = activeApp === "chat";
   const [customAppBackgroundRuns, setCustomAppBackgroundRuns] = useState<CustomAppBackgroundEventRun[]>([]);
   const [customAppBackgroundToolRuns, setCustomAppBackgroundToolRuns] = useState<CustomAppBackgroundToolRun[]>([]);
   const backgroundRunSeqRef = useRef(0);
@@ -1581,6 +1589,63 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     refreshHostState();
     window.addEventListener(CUSTOM_APP_HOST_STATE_UPDATED_EVENT, refreshHostState);
     return () => window.removeEventListener(CUSTOM_APP_HOST_STATE_UPDATED_EVENT, refreshHostState);
+  }, []);
+
+  // 桌面「聊天」图标未读红标：初次挂载等聊天存储水合完再打基线并取数，
+  // 之后靠消息落库事件 + 自身已读事件刷新。
+  useEffect(() => {
+    if (!desktopReady) return;
+    let cancelled = false;
+    const refreshChatUnread = () => {
+      if (cancelled) return;
+      // 聊天 App 正开着时，新消息不顶红标（用户就在里面看着），顺手记为已读。
+      // 防重入：markAllChatRead 会派发 CHAT_UNREAD_CHANGED，而本函数就挂着那个
+      // 监听，不拦一下会自我递归。
+      if (activeAppRef.current === "chat") {
+        if (unreadClearingRef.current) return;
+        unreadClearingRef.current = true;
+        markAllChatRead();
+        unreadClearingRef.current = false;
+        setChatUnreadCount(0);
+        return;
+      }
+      setChatUnreadCount(getTotalChatUnreadCount());
+    };
+    void hydrateChatStorage().then(() => {
+      if (cancelled) return;
+      ensureChatUnreadBaseline();
+      pruneChatReadState();
+      refreshChatUnread();
+    });
+    window.addEventListener(CHAT_MESSAGE_PUSHED_EVENT, refreshChatUnread);
+    window.addEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshChatUnread);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(CHAT_MESSAGE_PUSHED_EVENT, refreshChatUnread);
+      window.removeEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshChatUnread);
+    };
+  }, [desktopReady]);
+
+  // 聊天 App 进入前台：统一在这里清红标，覆盖所有打开路径（点图标、点消息横幅、
+  // 来电接听、小窗展开、小卷导航…），不必逐个入口加代码。
+  useEffect(() => {
+    if (!chatForeground) return;
+    markAllChatRead();
+    setChatUnreadCount(0);
+  }, [chatForeground]);
+
+  // 聊天相关事件后兜底重算一次（清空会话、批量删除、微信云同步拉回旧消息等
+  // 会绕过 CHAT_MESSAGE_PUSHED 的路径）；回到前台也补一次，防止后台期间漏刷。
+  useEffect(() => {
+    const refresh = () => setChatUnreadCount(getTotalChatUnreadCount());
+    window.addEventListener("chat-messages-updated", refresh);
+    window.addEventListener("weixin-messages-updated", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.removeEventListener("chat-messages-updated", refresh);
+      window.removeEventListener("weixin-messages-updated", refresh);
+      window.removeEventListener("focus", refresh);
+    };
   }, []);
 
   useEffect(() => {
@@ -2331,6 +2396,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
       return;
     }
     if (builtinIconId === "resources") setResourcesInitialPage("main");
+    // 聊天图标的红标清零交给「聊天进入前台」那个 effect，这里不用重复清
     if (builtinIconId === "chat") setChatInitSessionId(null);
     setActiveApp(builtinIconId);
   }
@@ -4589,7 +4655,9 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                                 if (!folder) return null;
                                 const folderBadge = folder.icons.reduce((sum, memberId) => {
                                   const appId = customAppIdFromIconId(memberId);
-                                  return sum + (appId ? customAppBadges[appId] ?? 0 : 0);
+                                  if (appId) return sum + (customAppBadges[appId] ?? 0);
+                                  // 文件夹里揣着内置聊天图标时，红点也要跟着（否则未读被藏进文件夹）
+                                  return sum + (memberId === "chat" ? chatUnreadCount : 0);
                                 }, 0);
                                 return (
                                   <button
@@ -4625,7 +4693,12 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                                 : null;
                               const iconImageUrl = iconSkinUrl || customIconUrl;
                               const hasImageIcon = Boolean(iconImageUrl);
-                              const badgeCount = customApp ? customAppBadges[customApp.id] ?? 0 : 0;
+                              // 自定义 APP 用宿主角标；内置「聊天」用未读统计，其余内置图标为 0
+                              const badgeCount = customApp
+                                ? customAppBadges[customApp.id] ?? 0
+                                : builtinIconId === "chat"
+                                  ? chatUnreadCount
+                                  : 0;
                               return (
                                 <button
                                   key={iconId}
@@ -4764,6 +4837,12 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                       : null;
                     const iconImageUrl = iconSkinUrl || customIconUrl;
                     const hasImageIcon = Boolean(iconImageUrl);
+                    // 与桌面页同一套规则：自定义 APP 走宿主角标，内置聊天走未读统计
+                    const dockBadgeCount = customApp
+                      ? customAppBadges[customApp.id] ?? 0
+                      : builtinIconId === "chat"
+                        ? chatUnreadCount
+                        : 0;
                     const isDragging = dragItem?.type === "icon" && dragItem.id === iconId;
                     return (
                       <button
@@ -4802,6 +4881,11 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                           ) : customIconUrl ? null : (
                             <CustomAppGlyph seed={customApp?.name || icon.label} className="icon-glyph" />
                           )}
+                          {dockBadgeCount > 0 ? (
+                            <span className="desktop-icon-badge" aria-label={`${dockBadgeCount} 条未读`}>
+                              {dockBadgeCount > 99 ? "99+" : dockBadgeCount}
+                            </span>
+                          ) : null}
                         </span>
                         <span className="icon-label">{icon.label}</span>
                       </button>
@@ -4971,7 +5055,11 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
                                 ? memberCustomApp.iconDataUrl ?? null
                                 : null;
                               const memberImageUrl = memberSkinUrl || memberCustomUrl;
-                              const memberBadge = memberCustomApp ? customAppBadges[memberCustomApp.id] ?? 0 : 0;
+                              const memberBadge = memberCustomApp
+                                ? customAppBadges[memberCustomApp.id] ?? 0
+                                : memberBuiltinId === "chat"
+                                  ? chatUnreadCount
+                                  : 0;
                               return (
                                 <button
                                   key={memberId}
