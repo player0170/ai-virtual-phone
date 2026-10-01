@@ -10,9 +10,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { CloudDownload, CloudUpload, Loader2, RefreshCw } from "lucide-react";
+import { CloudDownload, CloudUpload, Loader2, RefreshCw, Rocket } from "lucide-react";
 
 import { BottomSheet, ConfirmDialog } from "@/components/ui/modal";
+import { CloudServicesSetup } from "@/components/settings/cloud-services-setup";
 import { formatBytes } from "@/lib/data-management/backup";
 import { isCloudBackupConfigured, loadCloudBackupConfig, type CloudBackupConfig } from "@/lib/cloud-backup/config";
 import {
@@ -85,6 +86,10 @@ function CloudSyncPanel({ onClose }: { onClose: () => void }) {
   const [notice, setNotice] = useState<{ ok: boolean; text: string } | null>(null);
   const [pending, setPending] = useState<CloudBackupListItem | null>(null);
   const [restartHint, setRestartHint] = useState(false);
+  // 「重新部署 / 去部署」：不跳去设置页，直接把云服务部署那套 UI 内嵌进本面板——
+  // 功能与「设置 → 数据管理 → Cloud Backup」完全同一套（同一个 CloudServicesSetup
+  // 组件、同一份 ai_phone_cloud_backup_config_v1），所以两边配的是一份东西。
+  const [showDeploy, setShowDeploy] = useState(false);
 
   const refresh = useCallback(async (cfg: CloudBackupConfig) => {
     setListing(true);
@@ -105,6 +110,19 @@ function CloudSyncPanel({ onClose }: { onClose: () => void }) {
   }, [refresh]);
 
   const ready = Boolean(config && isCloudBackupConfigured(config));
+
+  // 部署页可能刚写入/换掉了云备份配置（取回 service_role key、换设备重连），
+  // 关掉它时重读配置并顺手刷新备份列表，回到面板就是新连接下的数据。
+  const refreshDeployState = async () => {
+    const fresh = loadCloudBackupConfig();
+    setConfig(fresh);
+    if (isCloudBackupConfigured(fresh)) await refresh(fresh);
+  };
+
+  const closeDeploy = async () => {
+    setShowDeploy(false);
+    await refreshDeployState();
+  };
 
   const doBackup = async () => {
     if (!config || busy) return;
@@ -167,6 +185,15 @@ function CloudSyncPanel({ onClose }: { onClose: () => void }) {
                 </span>
               </div>
             </div>
+            <div className="wg-cloud-panel-actions">
+              <button
+                type="button"
+                className="ui-btn ui-btn-primary"
+                onClick={() => setShowDeploy(true)}
+              >
+                <Rocket size={16} /> 去部署
+              </button>
+            </div>
           </div>
         ) : (
           <>
@@ -190,6 +217,16 @@ function CloudSyncPanel({ onClose }: { onClose: () => void }) {
                 {listing
                   ? <><Loader2 size={16} className="animate-spin" /> 读取中…</>
                   : <><RefreshCw size={16} /> 刷新列表</>}
+              </button>
+              {/* 与设置 → 数据管理 → Cloud Backup 的「重新部署 / 去部署」同源：
+                  内嵌同一套部署 UI，不跳转 */}
+              <button
+                type="button"
+                className="ui-btn ui-btn-outline"
+                onClick={() => setShowDeploy(true)}
+                disabled={Boolean(busy)}
+              >
+                <Rocket size={16} /> 重新部署
               </button>
             </div>
 
@@ -256,6 +293,16 @@ function CloudSyncPanel({ onClose }: { onClose: () => void }) {
           onConfirm={() => void doRestore(pending)}
           onCancel={() => setPending(null)}
         />
+      )}
+
+      {showDeploy && createPortal(
+        // 内嵌云服务部署（与设置里同一套 UI）。单独 portal 到手机壳里、而不是套在
+        // 上面的 BottomSheet 内部：抽屉那层 .modal-sheet 带入场 transform，
+        // 固定定位的后代会以它为基准，嵌进去会错位。
+        <BottomSheet title="云服务部署" onClose={() => void closeDeploy()}>
+          <CloudServicesSetup onConfigChanged={() => void refreshDeployState()} />
+        </BottomSheet>,
+        portalTarget(),
       )}
 
       {restartHint && (

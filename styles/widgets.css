@@ -3427,6 +3427,23 @@
 .wg-f90-s4 { top: 63.8%; right: 2.5%; width: 20%; height: 30%; }
 
 /* ----------------------------------------------------
+   云同步组件（1x2）：面板顶部/底部的按钮排布。
+   三个按钮会挤在一行里，允许换行并统一间距，窄屏兜底成两行。
+---------------------------------------------------- */
+.wg-cloud-panel-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.wg-cloud-panel-actions > .ui-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+/* ----------------------------------------------------
    Profile Card Widget (Freestyle 4x4 主页名片)
    上层背景图与下层白卡各占一半、通宽平齐，头像圆环骑缝悬浮；
    阴影跟随 --desktop-shadow-strength 主题开关，字号跟随 --app-text-scale。
