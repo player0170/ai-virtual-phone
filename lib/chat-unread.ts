@@ -111,8 +111,9 @@ export function ensureChatUnreadBaseline(): void {
  * 从尾部往前扫，碰到已读位置就停，所以正常情况只走几条。
  */
 export function getSessionChatUnreadCount(sessionId: string, state = loadReadState()): number {
-  const baseline = state[sessionId];
-  if (baseline === undefined) return 0;
+  // 没记过已读位置的会话（基线之后才建出来的新会话）按「一条都没读」算：
+  // 退回 -1 而不是 0，否则新会话的首条招呼消息会被显示成 0 条未读、红标不亮。
+  const baseline = state[sessionId] ?? -1;
   const messages = loadChatMessages(sessionId);
   let count = 0;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -123,6 +124,22 @@ export function getSessionChatUnreadCount(sessionId: string, state = loadReadSta
     if (isUnreadCandidate(msg)) count += 1;
   }
   return count;
+}
+
+/**
+ * 所有会话的未读数一次性算完（列表页逐行显示用）。
+ * 只读一次已读状态、只遍历一次会话，避免列表里 N 行各读一次。
+ */
+export function getChatUnreadBySession(): Record<string, number> {
+  if (typeof window === "undefined") return {};
+  ensureChatUnreadBaseline();
+  const state = loadReadState();
+  const result: Record<string, number> = {};
+  for (const session of loadChatSessions()) {
+    const count = getSessionChatUnreadCount(session.id, state);
+    if (count > 0) result[session.id] = count;
+  }
+  return result;
 }
 
 /** 全部会话的未读总数（桌面图标红点用）。 */

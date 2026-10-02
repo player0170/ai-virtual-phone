@@ -127,7 +127,7 @@ import type { DIYWidgetTemplate } from "@/lib/widget-types";
 import { DebugPromptPanel } from "@/components/debug-prompt-panel";
 import { QuickActionFloat } from "@/components/quick-action-float";
 import { CHAT_MESSAGE_PUSHED_EVENT, CHAT_REQUEST_REPLY_EVENT, hydrateChatStorage, loadChatSessions, loadChatMessages, pushChatMessage, type ChatMessage, type ChatSession } from "@/lib/chat-storage";
-import { CHAT_UNREAD_CHANGED_EVENT, ensureChatUnreadBaseline, getTotalChatUnreadCount, markAllChatRead, pruneChatReadState } from "@/lib/chat-unread";
+import { CHAT_UNREAD_CHANGED_EVENT, ensureChatUnreadBaseline, getTotalChatUnreadCount, markSessionChatRead, pruneChatReadState } from "@/lib/chat-unread";
 import { ensureGlobalBindingDefaults, resolveUserIdentity } from "@/lib/settings-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { generateChatCompletion, flattenCompletionResult } from "@/lib/chat-engine";
@@ -1077,10 +1077,8 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
   // 内置「聊天」图标的未读总数（红标）。与自定义 APP 的角标分开：聊天数据在
   // chat-storage，得自己算，见 lib/chat-unread.ts。
   const [chatUnreadCount, setChatUnreadCount] = useState(0);
-  // 标记已读会派发未读变更事件，而重算函数又监听该事件——用它挡住自我递归
-  const unreadClearingRef = useRef(false);
-  // 聊天 App 是否在前台（挂载时 activeApp 还没进 ref，用 effect 同步）
-  const chatForeground = activeApp === "chat";
+  // 当前正在看的会话（由聊天 App 上报，供已读标记使用）
+  const activeChatSessionRef = useRef<ChatSession | null>(null);
   const [customAppBackgroundRuns, setCustomAppBackgroundRuns] = useState<CustomAppBackgroundEventRun[]>([]);
   const [customAppBackgroundToolRuns, setCustomAppBackgroundToolRuns] = useState<CustomAppBackgroundToolRun[]>([]);
   const backgroundRunSeqRef = useRef(0);
@@ -1110,6 +1108,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     avatar: string | null;
     isGroup?: boolean;
   } | null>(null);
+  
   const chatMessageNoticeTimerRef = useRef<number | null>(null);
   // Swipe-up-to-dismiss state for the chat message notice banner.
   const [noticeDragY, setNoticeDragY] = useState(0);
@@ -1598,17 +1597,6 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     let cancelled = false;
     const refreshChatUnread = () => {
       if (cancelled) return;
-      // 聊天 App 正开着时，新消息不顶红标（用户就在里面看着），顺手记为已读。
-      // 防重入：markAllChatRead 会派发 CHAT_UNREAD_CHANGED，而本函数就挂着那个
-      // 监听，不拦一下会自我递归。
-      if (activeAppRef.current === "chat") {
-        if (unreadClearingRef.current) return;
-        unreadClearingRef.current = true;
-        markAllChatRead();
-        unreadClearingRef.current = false;
-        setChatUnreadCount(0);
-        return;
-      }
       setChatUnreadCount(getTotalChatUnreadCount());
     };
     void hydrateChatStorage().then(() => {
@@ -1626,13 +1614,9 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     };
   }, [desktopReady]);
 
-  // 聊天 App 进入前台：统一在这里清红标，覆盖所有打开路径（点图标、点消息横幅、
-  // 来电接听、小窗展开、小卷导航…），不必逐个入口加代码。
-  useEffect(() => {
-    if (!chatForeground) return;
-    markAllChatRead();
-    setChatUnreadCount(0);
-  }, [chatForeground]);
+  // 注意：这里刻意不做「进聊天 App 就全清」或「按上次会话清」——
+  // 图标红标要能回答"哪个人我还没点开"，清除只发生在真正点开某条会话时
+  // （见 renderAppBody 里的 onSessionChange）。
 
   // 聊天相关事件后兜底重算一次（清空会话、批量删除、微信云同步拉回旧消息等
   // 会绕过 CHAT_MESSAGE_PUSHED 的路径）；回到前台也补一次，防止后台期间漏刷。
@@ -4044,7 +4028,14 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#121110;color:rgb
             setChatInitSessionId(null);
           }}
           initialSessionId={chatInitSessionId}
-          onSessionChange={setActiveChatSession}
+          onSessionChange={(session) => {
+            setActiveChatSession(session);
+            activeChatSessionRef.current = session;
+            // 点开哪条就清哪条（微信语义）：进入某会话即记为已读，其余会话的红标
+            // 保留，桌面图标上的总数随之减少。退回列表（session 为 null）不动。
+            if (session) markSessionChatRead(session.id);
+            setChatUnreadCount(getTotalChatUnreadCount());
+          }}
         />
       );
     }
