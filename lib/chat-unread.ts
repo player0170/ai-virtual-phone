@@ -19,16 +19,46 @@ import {
   getChatMessagePreview,
   type ChatMessage,
 } from "./chat-storage";
+import { loadChatOfflineTurns } from "./chat-offline-storage";
 
 export const CHAT_UNREAD_CHANGED_EVENT = "ai-chat-unread-changed";
 
 const READ_STATE_KEY = "ai_phone_chat_read_state_v1";
 const BASELINE_KEY = "ai_phone_chat_unread_baseline_v1";
+// 线下记录是另一套存储（ai_phone_chat_offline_turns:<sessionId>，按 createdAt 排序），
+// 跟线上消息的 order 不是一个坐标系，所以线下单独记一份已读位置。
+const OFFLINE_READ_STATE_KEY = "ai_phone_chat_offline_read_state_v1";
+const OFFLINE_BASELINE_KEY = "ai_phone_chat_offline_baseline_v1";
 registerKvMigration(READ_STATE_KEY);
 registerKvMigration(BASELINE_KEY);
+registerKvMigration(OFFLINE_READ_STATE_KEY);
+registerKvMigration(OFFLINE_BASELINE_KEY);
 
 /** sessionId → 该会话最后一条已读消息的 order */
 type ReadState = Record<string, number>;
+/** sessionId → 该会话最后一条已读线下记录的 createdAt */
+type OfflineReadState = Record<string, string>;
+
+function loadOfflineReadState(): OfflineReadState {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = kvGet(OFFLINE_READ_STATE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const state: OfflineReadState = {};
+    for (const [sessionId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (sessionId && typeof value === "string" && value) state[sessionId] = value;
+    }
+    return state;
+  } catch {
+    return {};
+  }
+}
+
+function saveOfflineReadState(state: OfflineReadState): void {
+  if (typeof window === "undefined") return;
+  kvSet(OFFLINE_READ_STATE_KEY, JSON.stringify(state));
+}
 
 function loadReadState(): ReadState {
   if (typeof window === "undefined") return {};
@@ -89,28 +119,64 @@ function lastVisibleOrder(sessionId: string): number | null {
   return null;
 }
 
+/** 该会话最后一条线下记录的时间（没有则返回 null）。 */
+function lastOfflineTurnAt(sessionId: string): string | null {
+  const turns = loadChatOfflineTurns(sessionId);
+  return turns.length ? turns[turns.length - 1].createdAt : null;
+}
+
 /**
  * 首次启用时打基线：把当前各会话的最后一条消息记为已读。
  * 只做一次，之后靠 markAllChatRead / markSessionChatRead 推进已读位置。
  */
 export function ensureChatUnreadBaseline(): void {
   if (typeof window === "undefined") return;
-  if (kvGet(BASELINE_KEY) === "1") return;
-  const state = loadReadState();
-  for (const session of loadChatSessions()) {
-    if (state[session.id] !== undefined) continue;
-    const order = lastVisibleOrder(session.id);
-    if (order !== null) state[session.id] = order;
+  // 线上、线下各有一条独立的「首次基线」标记：任意一侧先跑过都不影响另一侧补打，
+  // 否则先跑线上那次会把线下基线一并标掉，线下历史记录全被算成未读。
+  if (kvGet(BASELINE_KEY) !== "1") {
+    const state = loadReadState();
+    for (const session of loadChatSessions()) {
+      if (state[session.id] !== undefined) continue;
+      const order = lastVisibleOrder(session.id);
+      if (order !== null) state[session.id] = order;
+    }
+    saveReadState(state);
+    kvSet(BASELINE_KEY, "1");
   }
-  saveReadState(state);
-  kvSet(BASELINE_KEY, "1");
+  if (kvGet(OFFLINE_BASELINE_KEY) !== "1") {
+    const offlineState = loadOfflineReadState();
+    for (const session of loadChatSessions()) {
+      if (offlineState[session.id] !== undefined) continue;
+      const offlineAt = lastOfflineTurnAt(session.id);
+      if (offlineAt) offlineState[session.id] = offlineAt;
+    }
+    saveOfflineReadState(offlineState);
+    kvSet(OFFLINE_BASELINE_KEY, "1");
+  }
+}
+
+/** 线下未读数：已读时间之后新增的线下回合数（一条回合 = 一轮交互）。 */
+function getSessionOfflineUnreadCount(sessionId: string, state = loadOfflineReadState()): number {
+  const baseline = state[sessionId] ?? "";
+  let count = 0;
+  for (const turn of loadChatOfflineTurns(sessionId)) {
+    if (baseline && turn.createdAt <= baseline) continue;
+    // 线下回合是「用户说了 + 角色回了」的合体记录，角色内容为空的不算数
+    if (!turn.assistantContent.trim() && !turn.summary.trim()) continue;
+    count += 1;
+  }
+  return count;
 }
 
 /**
- * 单个会话的未读数：已读位置之后、角色发来的可见消息条数。
+ * 单个会话的未读数（线上 + 线下合并）：已读位置之后、角色发来的可见内容条数。
  * 从尾部往前扫，碰到已读位置就停，所以正常情况只走几条。
  */
-export function getSessionChatUnreadCount(sessionId: string, state = loadReadState()): number {
+export function getSessionChatUnreadCount(
+  sessionId: string,
+  state = loadReadState(),
+  offlineState = loadOfflineReadState(),
+): number {
   // 没记过已读位置的会话（基线之后才建出来的新会话）按「一条都没读」算：
   // 退回 -1 而不是 0，否则新会话的首条招呼消息会被显示成 0 条未读、红标不亮。
   const baseline = state[sessionId] ?? -1;
@@ -123,7 +189,7 @@ export function getSessionChatUnreadCount(sessionId: string, state = loadReadSta
     if (order <= baseline) break;
     if (isUnreadCandidate(msg)) count += 1;
   }
-  return count;
+  return count + getSessionOfflineUnreadCount(sessionId, offlineState);
 }
 
 /**
@@ -134,9 +200,10 @@ export function getChatUnreadBySession(): Record<string, number> {
   if (typeof window === "undefined") return {};
   ensureChatUnreadBaseline();
   const state = loadReadState();
+  const offlineState = loadOfflineReadState();
   const result: Record<string, number> = {};
   for (const session of loadChatSessions()) {
-    const count = getSessionChatUnreadCount(session.id, state);
+    const count = getSessionChatUnreadCount(session.id, state, offlineState);
     if (count > 0) result[session.id] = count;
   }
   return result;
@@ -147,40 +214,51 @@ export function getTotalChatUnreadCount(): number {
   if (typeof window === "undefined") return 0;
   ensureChatUnreadBaseline();
   const state = loadReadState();
+  const offlineState = loadOfflineReadState();
   let total = 0;
   for (const session of loadChatSessions()) {
-    total += getSessionChatUnreadCount(session.id, state);
+    total += getSessionChatUnreadCount(session.id, state, offlineState);
   }
   return total;
 }
 
-/** 把某个会话标记为已读（进到该会话时用）。 */
+/** 把某个会话标记为已读（进到该会话时用）：线上、线下两套位置一起推进。 */
 export function markSessionChatRead(sessionId: string): void {
   if (!sessionId) return;
   const state = loadReadState();
   const order = lastVisibleOrder(sessionId);
   if (order !== null) state[sessionId] = order;
   saveReadState(state);
+
+  const offlineState = loadOfflineReadState();
+  const offlineAt = lastOfflineTurnAt(sessionId);
+  if (offlineAt) offlineState[sessionId] = offlineAt;
+  saveOfflineReadState(offlineState);
+
   dispatchUnreadChanged();
 }
 
-/** 把所有会话标记为已读（打开聊天 App 时用，微信式：进 App 即清）。 */
+/** 把所有会话标记为已读（线上、线下一起）。 */
 export function markAllChatRead(): void {
   if (typeof window === "undefined") return;
   const state = loadReadState();
+  const offlineState = loadOfflineReadState();
   for (const session of loadChatSessions()) {
     const order = lastVisibleOrder(session.id);
     if (order !== null) state[session.id] = order;
+    const offlineAt = lastOfflineTurnAt(session.id);
+    if (offlineAt) offlineState[session.id] = offlineAt;
   }
   saveReadState(state);
+  saveOfflineReadState(offlineState);
   dispatchUnreadChanged();
 }
 
 /** 丢弃已不存在的会话的已读记录，避免记录无限增长。 */
 export function pruneChatReadState(): void {
   if (typeof window === "undefined") return;
-  const state = loadReadState();
   const alive = new Set(loadChatSessions().map(session => session.id));
+  const state = loadReadState();
   let changed = false;
   for (const sessionId of Object.keys(state)) {
     if (alive.has(sessionId)) continue;
@@ -188,4 +266,13 @@ export function pruneChatReadState(): void {
     changed = true;
   }
   if (changed) saveReadState(state);
+
+  const offlineState = loadOfflineReadState();
+  let offlineChanged = false;
+  for (const sessionId of Object.keys(offlineState)) {
+    if (alive.has(sessionId)) continue;
+    delete offlineState[sessionId];
+    offlineChanged = true;
+  }
+  if (offlineChanged) saveOfflineReadState(offlineState);
 }

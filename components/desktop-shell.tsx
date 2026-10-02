@@ -128,6 +128,7 @@ import { DebugPromptPanel } from "@/components/debug-prompt-panel";
 import { QuickActionFloat } from "@/components/quick-action-float";
 import { CHAT_MESSAGE_PUSHED_EVENT, CHAT_REQUEST_REPLY_EVENT, hydrateChatStorage, loadChatSessions, loadChatMessages, pushChatMessage, type ChatMessage, type ChatSession } from "@/lib/chat-storage";
 import { CHAT_UNREAD_CHANGED_EVENT, ensureChatUnreadBaseline, getTotalChatUnreadCount, markSessionChatRead, pruneChatReadState } from "@/lib/chat-unread";
+import { CHAT_OFFLINE_TURNS_CHANGED_EVENT } from "@/lib/chat-offline-storage";
 import { ensureGlobalBindingDefaults, resolveUserIdentity } from "@/lib/settings-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { generateChatCompletion, flattenCompletionResult } from "@/lib/chat-engine";
@@ -1079,6 +1080,8 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
   const [chatUnreadCount, setChatUnreadCount] = useState(0);
   // 当前正在看的会话（由聊天 App 上报，供已读标记使用）
   const activeChatSessionRef = useRef<ChatSession | null>(null);
+  // 标记已读会派发未读变更事件，而重算函数就挂着那个监听——用它挡住自我递归
+  const unreadClearingRef = useRef(false);
   const [customAppBackgroundRuns, setCustomAppBackgroundRuns] = useState<CustomAppBackgroundEventRun[]>([]);
   const [customAppBackgroundToolRuns, setCustomAppBackgroundToolRuns] = useState<CustomAppBackgroundToolRun[]>([]);
   const backgroundRunSeqRef = useRef(0);
@@ -1597,6 +1600,17 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     let cancelled = false;
     const refreshChatUnread = () => {
       if (cancelled) return;
+      // 你正在看的那个会话不该顶红标（线上线下都一样）：它刚产生的消息在眼前，
+      // 顺手记为已读。只认「当前会话」，不碰列表里其他会话。
+      // 防重入：markSessionChatRead 会派发未读变更事件，而本函数挂着那个监听。
+      const currentSessionId = activeAppRef.current === "chat"
+        ? activeChatSessionRef.current?.id
+        : undefined;
+      if (currentSessionId && !unreadClearingRef.current) {
+        unreadClearingRef.current = true;
+        markSessionChatRead(currentSessionId);
+        unreadClearingRef.current = false;
+      }
       setChatUnreadCount(getTotalChatUnreadCount());
     };
     void hydrateChatStorage().then(() => {
@@ -1607,10 +1621,13 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     });
     window.addEventListener(CHAT_MESSAGE_PUSHED_EVENT, refreshChatUnread);
     window.addEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshChatUnread);
+    // 线下模式的回合不落 chat-storage，得单独听它的事件
+    window.addEventListener(CHAT_OFFLINE_TURNS_CHANGED_EVENT, refreshChatUnread);
     return () => {
       cancelled = true;
       window.removeEventListener(CHAT_MESSAGE_PUSHED_EVENT, refreshChatUnread);
       window.removeEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshChatUnread);
+      window.removeEventListener(CHAT_OFFLINE_TURNS_CHANGED_EVENT, refreshChatUnread);
     };
   }, [desktopReady]);
 

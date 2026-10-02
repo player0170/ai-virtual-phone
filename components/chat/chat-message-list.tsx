@@ -4,6 +4,7 @@ import React, { useState, useEffect, useSyncExternalStore } from "react";
 import { ChevronLeft } from "lucide-react";
 import { loadChatSessions, loadChatContacts, ChatSession, createOrGetSession, createGroupSession, pushChatMessage, addChatContact, loadChatMessages, getLastVisibleSessionMessage, getChatMessagePreview } from "@/lib/chat-storage";
 import { CHAT_UNREAD_CHANGED_EVENT, getChatUnreadBySession } from "@/lib/chat-unread";
+import { CHAT_OFFLINE_TURNS_CHANGED_EVENT } from "@/lib/chat-offline-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { Character } from "@/lib/character-types";
 import { resolveUserIdentity } from "@/lib/settings-storage";
@@ -163,10 +164,13 @@ export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, on
         window.addEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshUnread);
         window.addEventListener("chat-messages-updated", refreshUnread);
         window.addEventListener("weixin-messages-updated", refreshUnread);
+        // 线下记录不走 chat-storage，靠这个事件刷新（未读统计已含线下）
+        window.addEventListener(CHAT_OFFLINE_TURNS_CHANGED_EVENT, refreshUnread);
         return () => {
             window.removeEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshUnread);
             window.removeEventListener("chat-messages-updated", refreshUnread);
             window.removeEventListener("weixin-messages-updated", refreshUnread);
+            window.removeEventListener(CHAT_OFFLINE_TURNS_CHANGED_EVENT, refreshUnread);
         };
     }, []);
 
