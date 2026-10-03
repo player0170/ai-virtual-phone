@@ -6,8 +6,10 @@
 // 为什么不复用 ChatSession.unreadCount：那个字段只在类型里定义过，全仓没有
 // 写入点也没有渲染点（遗留字段），语义是空的。这里自己维护一套：
 //   · 每个会话记一条「最后已读位置」（该会话最后一条可见消息的 order）；
-//   · 未读数 = 该位置之后、由角色发来的可见消息条数；
-//   · 打开聊天 App 时把全部会话标记为已读（微信式：进了 App 就算看过）。
+//   · 未读数 = 该位置之后、由角色发来的可见消息条数（线上按消息 order，线下按回合
+//     createdAt，两套坐标系各记一份已读位置）；
+//   · 点开哪条会话就清哪条（微信语义）：进入某会话即记为已读，其余会话的红标保留。
+//     桌面图标红标要能回答"哪个人我还没点开"，所以不做"进 App 就全清"。
 //
 // 首次启用时做一次基线初始化：把当时各会话的最后一条消息记为「已读」，避免
 // 装上功能的第一眼就把历史聊天全算成未读、红点顶着几百条。
@@ -22,6 +24,54 @@ import {
 import { loadChatOfflineTurns } from "./chat-offline-storage";
 
 export const CHAT_UNREAD_CHANGED_EVENT = "ai-chat-unread-changed";
+
+// ── 红标开关：线上、线下分开控制 ─────────────────────────
+// 关掉某一侧就只统计另一侧；两侧都关 = 完全不显示红标。
+export type ChatUnreadBadgeSettings = {
+  /** 线上模式是否显示未读红标 */
+  online: boolean;
+  /** 线下模式是否显示未读红标 */
+  offline: boolean;
+};
+
+const BADGE_SETTINGS_KEY = "ai_phone_chat_unread_badge_settings_v1";
+registerKvMigration(BADGE_SETTINGS_KEY);
+
+const DEFAULT_BADGE_SETTINGS: ChatUnreadBadgeSettings = { online: true, offline: true };
+
+export function loadChatUnreadBadgeSettings(): ChatUnreadBadgeSettings {
+  if (typeof window === "undefined") return { ...DEFAULT_BADGE_SETTINGS };
+  try {
+    const raw = kvGet(BADGE_SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_BADGE_SETTINGS };
+    const parsed = JSON.parse(raw) as Partial<ChatUnreadBadgeSettings>;
+    return {
+      online: parsed.online !== false,
+      offline: parsed.offline !== false,
+    };
+  } catch {
+    return { ...DEFAULT_BADGE_SETTINGS };
+  }
+}
+
+export function saveChatUnreadBadgeSettings(settings: ChatUnreadBadgeSettings): void {
+  if (typeof window === "undefined") return;
+  kvSet(BADGE_SETTINGS_KEY, JSON.stringify({
+    online: settings.online !== false,
+    offline: settings.offline !== false,
+  }));
+  dispatchUnreadChanged();
+}
+
+/** 未读构成：线上几条、线下几条（分开用于决定红标底色）。 */
+export type ChatUnreadBreakdown = {
+  online: number;
+  offline: number;
+};
+
+function sumBreakdown(parts: ChatUnreadBreakdown): number {
+  return parts.online + parts.offline;
+}
 
 const READ_STATE_KEY = "ai_phone_chat_read_state_v1";
 const BASELINE_KEY = "ai_phone_chat_unread_baseline_v1";
@@ -172,24 +222,35 @@ function getSessionOfflineUnreadCount(sessionId: string, state = loadOfflineRead
  * 单个会话的未读数（线上 + 线下合并）：已读位置之后、角色发来的可见内容条数。
  * 从尾部往前扫，碰到已读位置就停，所以正常情况只走几条。
  */
-export function getSessionChatUnreadCount(
+export function getSessionChatUnreadBreakdown(
   sessionId: string,
   state = loadReadState(),
   offlineState = loadOfflineReadState(),
-): number {
+): ChatUnreadBreakdown {
   // 没记过已读位置的会话（基线之后才建出来的新会话）按「一条都没读」算：
   // 退回 -1 而不是 0，否则新会话的首条招呼消息会被显示成 0 条未读、红标不亮。
   const baseline = state[sessionId] ?? -1;
   const messages = loadChatMessages(sessionId);
-  let count = 0;
+  let online = 0;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i];
     const order = messageOrder(msg);
     if (order === null) continue;
     if (order <= baseline) break;
-    if (isUnreadCandidate(msg)) count += 1;
+    if (isUnreadCandidate(msg)) online += 1;
   }
-  return count + getSessionOfflineUnreadCount(sessionId, offlineState);
+  return { online, offline: getSessionOfflineUnreadCount(sessionId, offlineState) };
+}
+
+/** 单个会话的未读数（按开关过滤后的合计）。 */
+export function getSessionChatUnreadCount(
+  sessionId: string,
+  state = loadReadState(),
+  offlineState = loadOfflineReadState(),
+  settings = loadChatUnreadBadgeSettings(),
+): number {
+  const parts = getSessionChatUnreadBreakdown(sessionId, state, offlineState);
+  return (settings.online ? parts.online : 0) + (settings.offline ? parts.offline : 0);
 }
 
 /**
@@ -197,14 +258,27 @@ export function getSessionChatUnreadCount(
  * 只读一次已读状态、只遍历一次会话，避免列表里 N 行各读一次。
  */
 export function getChatUnreadBySession(): Record<string, number> {
+  return getChatUnreadBreakdownBySession();
+}
+
+/**
+ * 每个会话的未读明细（线上/线下各几条）。列表要按构成决定红标底色，
+ * 所以这里返回明细而不是合计；调用方自己去 sumBreakdown。
+ */
+export function getChatUnreadBreakdownBySession(): Record<string, ChatUnreadBreakdown> {
   if (typeof window === "undefined") return {};
   ensureChatUnreadBaseline();
+  const settings = loadChatUnreadBadgeSettings();
   const state = loadReadState();
   const offlineState = loadOfflineReadState();
-  const result: Record<string, number> = {};
+  const result: Record<string, ChatUnreadBreakdown> = {};
   for (const session of loadChatSessions()) {
-    const count = getSessionChatUnreadCount(session.id, state, offlineState);
-    if (count > 0) result[session.id] = count;
+    const raw = getSessionChatUnreadBreakdown(session.id, state, offlineState);
+    const parts = {
+      online: settings.online ? raw.online : 0,
+      offline: settings.offline ? raw.offline : 0,
+    };
+    if (sumBreakdown(parts) > 0) result[session.id] = parts;
   }
   return result;
 }
@@ -213,11 +287,13 @@ export function getChatUnreadBySession(): Record<string, number> {
 export function getTotalChatUnreadCount(): number {
   if (typeof window === "undefined") return 0;
   ensureChatUnreadBaseline();
+  const settings = loadChatUnreadBadgeSettings();
   const state = loadReadState();
   const offlineState = loadOfflineReadState();
   let total = 0;
   for (const session of loadChatSessions()) {
-    total += getSessionChatUnreadCount(session.id, state, offlineState);
+    const parts = getSessionChatUnreadBreakdown(session.id, state, offlineState);
+    total += (settings.online ? parts.online : 0) + (settings.offline ? parts.offline : 0);
   }
   return total;
 }

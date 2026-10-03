@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useSyncExternalStore } from "react";
 import { ChevronLeft } from "lucide-react";
 import { loadChatSessions, loadChatContacts, ChatSession, createOrGetSession, createGroupSession, pushChatMessage, addChatContact, loadChatMessages, getLastVisibleSessionMessage, getChatMessagePreview } from "@/lib/chat-storage";
-import { CHAT_UNREAD_CHANGED_EVENT, getChatUnreadBySession } from "@/lib/chat-unread";
+import { CHAT_UNREAD_CHANGED_EVENT, getChatUnreadBreakdownBySession, type ChatUnreadBreakdown } from "@/lib/chat-unread";
 import { CHAT_OFFLINE_TURNS_CHANGED_EVENT } from "@/lib/chat-offline-storage";
 import { loadCharacters } from "@/lib/character-storage";
 import { Character } from "@/lib/character-types";
@@ -90,7 +90,8 @@ type ChatMessageListProps = {
 
 export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, onSelectMascot }: ChatMessageListProps) {
     const [sessions, setSessions] = useState<ChatSession[]>([]);
-    const [unreadBySession, setUnreadBySession] = useState<Record<string, number>>({});
+    // 每条会话的未读构成（线上/线下各几条）：数字用于红标，构成用于决定底色
+    const [unreadBySession, setUnreadBySession] = useState<Record<string, ChatUnreadBreakdown>>({});
     const [listFilter, setListFilter] = useState("");
     const [listTab, setListTab] = useState<"all" | "private" | "group">("all");
     const [showPlusMenu, setShowPlusMenu] = useState(false);
@@ -157,9 +158,10 @@ export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, on
     }, []);
 
     // 每条会话右侧的未读红标：与桌面图标同一份统计（lib/chat-unread.ts），
-    // 这样列表里的数字和图标上的总数永远对得上。
+    // 这样列表里的数字和图标上的总数永远对得上；底色也共用同一套语义
+    // （只有线下未读时用琥珀色，见 styles/chat.css）。
     useEffect(() => {
-        const refreshUnread = () => setUnreadBySession(getChatUnreadBySession());
+        const refreshUnread = () => setUnreadBySession(getChatUnreadBreakdownBySession());
         refreshUnread();
         window.addEventListener(CHAT_UNREAD_CHANGED_EVENT, refreshUnread);
         window.addEventListener("chat-messages-updated", refreshUnread);
@@ -330,7 +332,7 @@ export function ChatMessageList({ onCloseApp, activeSession, onSelectSession, on
                                         session={s}
                                         onSelect={() => onSelectSession(s)}
                                         isPinned={!!s.isPinned}
-                                        unreadCount={unreadBySession[s.id] ?? 0}
+                                        unreadParts={unreadBySession[s.id]}
                                     />
                                 </div>
                             ));
@@ -773,8 +775,13 @@ function ContactPicker({ onClose, onSelect }: { onClose: () => void; onSelect: (
     );
 }
 
-function SessionItem({ session, onSelect, isPinned, unreadCount = 0 }: { session: ChatSession, onSelect: () => void, isPinned?: boolean, unreadCount?: number }) {
+function SessionItem({ session, onSelect, isPinned, unreadParts }: { session: ChatSession, onSelect: () => void, isPinned?: boolean, unreadParts?: ChatUnreadBreakdown }) {
     // 有未读时名字加粗，与微信的观感一致（红标数字见下方 chat-session-unread-badge）
+    const unreadCount = (unreadParts?.online ?? 0) + (unreadParts?.offline ?? 0);
+    // 底色语义与桌面角标一致：只有线下未读时才换琥珀色；线上线下都有、
+    // 或纯线上，都用默认红——混着的时候红标本身说不清是哪一侧。
+    const unreadScope: "online" | "offline" =
+        (unreadParts?.offline ?? 0) > 0 && (unreadParts?.online ?? 0) === 0 ? "offline" : "online";
     const chars = loadCharacters();
     const character = chars.find(c => c.id === session.contactId);
     const lastVisibleMessage = getLastVisibleSessionMessage(session.id);
@@ -843,7 +850,11 @@ function SessionItem({ session, onSelect, isPinned, unreadCount = 0 }: { session
                         {preview || getLastNonEmptyPreview(session.id)}
                     </span>
                     {unreadCount > 0 && (
-                        <span className="chat-session-unread-badge" aria-label={`${unreadCount} 条未读`}>
+                        <span
+                            className="chat-session-unread-badge"
+                            aria-label={`${unreadCount} 条未读`}
+                            data-scope={unreadScope}
+                        >
                             {unreadCount > 99 ? "99+" : unreadCount}
                         </span>
                     )}
