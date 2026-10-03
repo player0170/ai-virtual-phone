@@ -1117,7 +1117,7 @@ export function DesktopShell({ initialThemeProfile, initialThemeAssets }: Deskto
     avatar: string | null;
     isGroup?: boolean;
   } | null>(null);
-  
+
   const chatMessageNoticeTimerRef = useRef<number | null>(null);
   // Swipe-up-to-dismiss state for the chat message notice banner.
   const [noticeDragY, setNoticeDragY] = useState(0);
