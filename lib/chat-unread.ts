@@ -137,11 +137,22 @@ function dispatchUnreadChanged(): void {
   window.dispatchEvent(new CustomEvent(CHAT_UNREAD_CHANGED_EVENT));
 }
 
+/**
+ * 这些 origin 的消息不算「聊天未读」：它们不是角色趁你没看时发来的消息，
+ * 而是别的模块借这条会话落的数据。
+ *   · reading_discuss：阅读 App 的讨论记录；
+ *   · custom_app / custom_app_background：自定义 APP 写进来的（chat.sendCard、
+ *     chat.sendMessage、chat.history、chat.requestReply，以及 ai.generate 回传的
+ *     appendMessages）。这些消息的 role 常常是 assistant，若不排除，装一个会写
+ *     聊天的 APP 就会把桌面「聊天」图标的红标顶起来——红标本该只反映聊天本身。
+ */
+const NON_CHAT_UNREAD_ORIGINS = new Set(["reading_discuss", "custom_app", "custom_app_background"]);
+
 /** 这条消息算不算一条「值得提示的未读」：角色发来的可见内容。 */
 function isUnreadCandidate(msg: ChatMessage): boolean {
   if (msg.role !== "assistant") return false;
   if (msg.isRetracted) return false;
-  if (msg.origin === "reading_discuss") return false;
+  if (msg.origin && NON_CHAT_UNREAD_ORIGINS.has(msg.origin)) return false;
   if (
     msg.mediaType === "tool_call"
     || msg.mediaType === "tool_result"
